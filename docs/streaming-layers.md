@@ -45,9 +45,22 @@ Cost is dominated by **decode vs prefill**:
   efficient. Long-context ingestion is far better than generation.
 
 **So streaming is for: long input → short answer, latency-tolerant, high-value
-queries.** For a legal RAG system — feed a big model a pile of retrieved context,
-get a short ruling — that shape fits well. It is **not** for chatty multi-turn
-generation.
+queries.** It is **not** for chatty multi-turn generation.
+
+### Canonical use: a critique / verification agent
+
+The ideal streaming workload, because it makes the weakness disappear. Give a big
+model a large legal input (brief, contract, opinion) and constrain the output to
+a handful of tokens — "what needs improvement," a pass/fail, a risk flag, a
+short list of weak sections. Decode (the expensive part under streaming) is only
+~10 tokens; prefill (efficient) dominates. You get a 70B's judgment on hardware
+that can't hold a 70B resident.
+
+Rough one-shot latency (confirm in S1): **70B-Q4 ~35–45 s**, **30B-Q4 ~15–20 s** —
+fine for an async/background critique pass, and the model is far stronger than
+anything that fits resident. Other fits of the same shape: PII/privilege sweep,
+citation-missing flags, doc-type classification at high quality, "does this
+argument hold" gut-checks.
 
 ## Where it fits
 
@@ -79,8 +92,9 @@ real queries before committing to (2)/(3).
 
 - **S0 — seam:** orchestrator-facing API marks a model as `streaming` tier;
   `/v1/status` reports it; router can target it. No engine yet.
-- **S1 — prototype:** stand up option (1), measure decode tok/s and prefill time
-  for a 30B and a 70B on the 5060 against real RAG queries.
+- **S1 — prototype:** stand up option (1), measure prefill time and short-output
+  (~10-token) critique latency for a 30B and a 70B on the 5060 against real
+  long-input legal critique tasks (the canonical use), not chatty generation.
 - **S2 — integrate:** pick the engine, wire it behind the control plane, reuse
   the pinned warm tier for the layer ring where applicable.
 

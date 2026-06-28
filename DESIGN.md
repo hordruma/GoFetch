@@ -76,6 +76,16 @@ region still takes the driver's pageable→staging→VRAM path. The *fast DMA* w
 inference process — see **M-deep** below. The `locked` tier is the buffer that
 in-process engine will register.
 
+### Vendor-neutral by design
+
+GoFetch must not hard-bind to CUDA: NVIDIA and AMD now, Intel/Apple later. The
+biggest reason to build *on* llama.cpp rather than a bespoke CUDA engine is that
+it already ships CUDA / HIP-ROCm / Vulkan / SYCL / Metal backends, so multi-vendor
+support is mostly a build choice. The in-process (M-deep) engine must therefore be
+**backend-abstracted** — see [docs/backends.md](./docs/backends.md), which also
+covers using the NPU as an auxiliary lane for always-on small models (embeddings,
+reranker, router, guards).
+
 ### Engine: build on llama-swap
 
 [llama-swap](https://github.com/mostlygeek/llama-swap) already solves
