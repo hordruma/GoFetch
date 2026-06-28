@@ -63,15 +63,20 @@ pipeline, which frees the GPU + VRAM entirely for generation/critique:
 | **Guards** (PII, privilege, safety) | good | small, always-on filters                          |
 | Draft model for speculative decode | poor (for now) | sync overhead + thin software usually cancels the win |
 
-**Software stacks:** Intel → OpenVINO (NPU plugin) or ONNX Runtime + OpenVINO EP;
-AMD → Ryzen AI SW / ONNX Runtime + VitisAI EP; Windows also has DirectML. **Linux
-NPU support is newer** — Intel NPU driver and AMD XDNA driver landed in recent
-kernels (~6.10+); check driver status when you switch next week.
+**Confirmed hardware: Intel Core Ultra → "AI Boost" NPU.** Software stack is
+**OpenVINO** (device `"NPU"`), or ONNX Runtime with the OpenVINO execution
+provider. Models run as OpenVINO IR (convert from ONNX/HF) at INT8.
+
+**Linux bring-up (for next week):** needs the `intel_vpu` kernel driver (in
+kernel since ~6.7 for Meteor Lake; newer Core Ultra wants a recent kernel) plus
+the user-space NPU stack — the Level-Zero NPU driver and firmware
+(`intel-level-zero-npu`, `intel-driver-compiler-npu`, `intel-fw-npu`) — then
+OpenVINO picks up the `NPU` device. Verify with `ls /dev/accel/` and OpenVINO's
+`hello_query_device`. Practical constraints: the NPU plugin prefers **static
+shapes** and INT8 and has limited op coverage, so fixed-sequence-length
+embeddings/classifiers fit best; dynamic-shape generative models do not.
 
 **Design fit:** model the NPU as a separate "auxiliary models" lane in GoFetch —
-embeddings/reranker/router/guards routed there, GPU reserved for the hot-swap
-pool and the streaming critique tier. This is additive and can come after the GPU
-path works.
-
-**Open input needed:** which NPU is it? Check the CPU model (Intel Core Ultra ⇒
-AI Boost; AMD Ryzen AI ⇒ XDNA). That picks the software stack.
+fixed-shape embeddings / router-classifier / guards routed there (good fits for
+its constraints), GPU reserved for the hot-swap pool and the streaming critique
+tier. Additive; comes after the GPU path works.
