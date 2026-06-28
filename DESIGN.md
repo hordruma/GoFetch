@@ -113,9 +113,10 @@ staging) and gets the upload itself to the hardware ceiling. It does **not**
 make swaps free — that requires unified-memory hardware (Apple Silicon,
 Grace-Hopper), which a discrete 5060 is not.
 
-**Explicitly out of scope:** streaming-weights inference (computing layer 0
-while later layers still upload). llama.cpp has no such mode; it is a
-research-grade engine contribution, not a GoFetch feature.
+**Related but separate:** *streaming-layers* inference (run a model bigger than
+VRAM by streaming its layers from RAM) is a different axis from swap latency — a
+planned escalation tier, documented in
+[docs/streaming-layers.md](./docs/streaming-layers.md).
 
 **Build & verification note.** The CUDA path cannot be compiled or benchmarked
 in a CPU-only CI sandbox (no GPU, no CUDA toolkit, no vendored llama.cpp). It
@@ -164,6 +165,9 @@ internal/api/        HTTP control API + OpenAI proxy
 5. **M-deep — in-process engine:** cgo + vendored llama.cpp; `cudaHostRegister`
    on the `locked` tier, persistent context, in-place model free/load,
    multi-stream upload. Built and benchmarked on the 5060 (not in CI).
+6. **S — streaming-layers tier:** run 30–70B models bigger than VRAM by streaming
+   layers from RAM, for latency-tolerant prefill-heavy escalation queries. See
+   docs/streaming-layers.md (S0 seam → S1 prototype → S2 integrate).
 
 ## Non-goals
 

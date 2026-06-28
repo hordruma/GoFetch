@@ -97,8 +97,10 @@ at pageable ~7 GB/s ≈ **0.7 s**.
 - **Unified memory / `cudaMallocManaged` / zero-copy mapped weights**: weights are
   touched every token, so on-demand page migration faults constantly mid-decode —
   bigger capacity, much slower decode. Wrong tool for weights.
-- **Streaming-weights inference** (compute layer 0 while later layers upload):
-  llama.cpp has no such mode; research-grade, out of scope.
+- **Streaming-weights inference** is a *different axis*, not a rejected lever: it
+  trades decode speed to run models bigger than VRAM. It's a planned escalation
+  tier — see [streaming-layers.md](./streaming-layers.md). (Not in llama.cpp, but
+  shipped elsewhere: FlexGen, ZeRO-Inference, AirLLM.)
 - **GPUDirect Storage** (NVMe→VRAM, bypass RAM): helps only *cold* loads, and
   laptop support is effectively absent. Our win is RAM-warm, so N/A.
 
