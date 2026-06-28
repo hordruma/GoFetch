@@ -123,18 +123,38 @@ make probe
 Sample output:
 
 ```
-transfer size      : 4.80 GB  (x5 iters)
-H2D bandwidth:
-  pageable         :   6.90 GB/s   (today, no surgery)
-  pinned (register):  12.80 GB/s   (register cost 180.0 ms, one-time at warm)
-  pinned (alloc)   :  13.10 GB/s   (ceiling; +30.0 ms alloc + a RAM copy)
-VRAM allocator:
-  cudaMalloc       :   40.0 ms
-  cudaFree         :   12.0 ms
+transfer size : 4.80 GB   (x7 iters, chunk 8 MB)
 
-upload of 4.80 GB: 696 ms pageable  ->  375 ms pinned   (1.9x)
+H2D bandwidth (mean / peak GB/s):
+  pageable          :   6.90 /   7.10    (today, no surgery)
+  pinned (register) :  12.80 /  13.00    (register 180 ms once at warm; no copy)
+  pinned (alloc)    :  13.10 /  13.20    (+30 ms alloc +380 ms RAM-copy, every load)
+  pinned (chunked)  :  11.90             (representative: many tensor-sized copies)
+
+VRAM allocator (per swap if not pooled):
+  cudaMalloc        :   40.0 ms
+  cudaFree          :   12.0 ms
+
+upload of 4.80 GB (realistic, chunked): 696 ms pageable -> 403 ms pinned (1.7x)
 ```
 
-Read it as: pinned roughly halves the upload; if `register` ≈ `alloc` and
-register succeeded, prefer register-in-place (no RAM copy); the `cudaMalloc`/
-`Free` figures tell us whether lever 5 (a VRAM pool) is worth it.
+How to read it:
+- **Use the chunked number as reality.** The monolithic mean/peak are an
+  optimistic ceiling; the loader's many small tensor copies land near `chunked`.
+- **Peak vs mean** — if mean ≪ peak, the GPU is throttling or the PCIe link is
+  power-managing; plug in, set the power profile to performance, and re-run.
+- **register vs alloc** — if `register` succeeded and ≈ `alloc`, prefer
+  register-in-place: `alloc` pays the `RAM-copy` (`FillMS`) on *every* load.
+- **malloc/free** — if these are several ms, lever 5 (a pooled VRAM allocator
+  that avoids per-swap free/alloc) is worth building.
+
+### Probe caveats (what it does NOT tell you)
+
+- It is a **transport** benchmark, not a swap. A real swap also rebuilds the
+  context/graph and allocates KV — measure that in the engine, not here.
+- It does **not** measure transfer/compute **overlap** (lever 6); that only shows
+  up against real decode work, so it belongs in the engine benchmark.
+- **OS matters.** The `#cgo` paths assume native Linux + CUDA at
+  `/usr/local/cuda`. Under **WSL2**, pinned-memory behavior and `cudaHostRegister`
+  on mmap differ and can mislead; on **Windows** the build needs MSVC and
+  different lib paths. Confirm the environment before trusting the numbers.
