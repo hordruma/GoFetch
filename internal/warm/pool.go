@@ -1,9 +1,17 @@
 // Package warm manages the RAM warm-pool: GGUF files held hot in the OS page
-// cache so a subsequent llama-server start loads at RAM speed instead of disk
-// speed. Warming is done by mmap-ing the file, faulting every page in, and
-// optionally mlock-ing it. Eviction is LRU under a byte budget.
+// cache so a subsequent model load reaches VRAM at RAM speed instead of disk
+// speed. It supports two tiers:
 //
-// Linux only (uses mmap/mlock/madvise via the syscall package).
+//   - TierCache:  mmap + page-fault. Cheap, evictable, holds many models. The
+//     weights are resident in the page cache but remain pageable, so a CUDA
+//     upload from them takes the driver's pageable→staging→VRAM path.
+//   - TierLocked: mmap + page-fault + mlock. Page-locked and non-evictable
+//     (separate, smaller budget). This is the FOUNDATION for the fast DMA path:
+//     an in-process CUDA engine can cudaHostRegister a locked region and then
+//     DMA it to VRAM at the PCIe ceiling. mlock alone does not give fast DMA —
+//     it guarantees residency and removes page-fault stalls.
+//
+// Linux only (mmap/mlock/madvise via the syscall package, stdlib only).
 package warm
 
 import (
@@ -17,53 +25,93 @@ import (
 
 const pageSize = 4096
 
-type entry struct {
-	path   string
-	data   []byte
-	size   int64
-	last   time.Time
-	locked bool
+// Tier selects how aggressively a file is held in RAM.
+type Tier int
+
+const (
+	TierCache  Tier = iota // page-cache resident, evictable
+	TierLocked             // page-locked (mlock), non-evictable, separate budget
+)
+
+func (t Tier) String() string {
+	if t == TierLocked {
+		return "locked"
+	}
+	return "cache"
 }
 
-// Pool is a concurrency-safe set of warmed files bounded by a byte budget.
+// ParseTier maps a config/request string to a Tier. Empty defaults to cache.
+func ParseTier(s string) (Tier, error) {
+	switch s {
+	case "", "cache":
+		return TierCache, nil
+	case "locked", "pinned":
+		return TierLocked, nil
+	default:
+		return TierCache, fmt.Errorf("unknown warm tier %q (want cache|locked)", s)
+	}
+}
+
+type entry struct {
+	path string
+	data []byte
+	size int64
+	tier Tier
+	last time.Time
+}
+
+// Pool is a concurrency-safe set of warmed files. Each tier has its own byte
+// budget and its own LRU set, so promoting a hot model to the locked tier never
+// evicts the large page-cache tier and vice-versa.
 type Pool struct {
 	mu      sync.Mutex
 	entries map[string]*entry
-	used    int64
-	budget  int64
-	lock    bool
+	used    [2]int64 // indexed by Tier
+	budget  [2]int64 // indexed by Tier
 	now     func() time.Time
 }
 
-// New constructs a warm-pool. If lock is true, warmed files are mlock-ed (this
-// requires sufficient RLIMIT_MEMLOCK).
-func New(budget int64, lock bool) *Pool {
-	return &Pool{
-		entries: make(map[string]*entry),
-		budget:  budget,
-		lock:    lock,
-		now:     time.Now,
-	}
+// New constructs a warm-pool. cacheBudget bounds TierCache; lockedBudget bounds
+// TierLocked. A budget of 0 means unbounded for that tier.
+func New(cacheBudget, lockedBudget int64) *Pool {
+	p := &Pool{entries: make(map[string]*entry), now: time.Now}
+	p.budget[TierCache] = cacheBudget
+	p.budget[TierLocked] = lockedBudget
+	return p
 }
 
 // Info is a status snapshot of one warmed file.
 type Info struct {
-	Path   string    `json:"path"`
-	Size   int64     `json:"size"`
-	Locked bool      `json:"locked"`
-	Last   time.Time `json:"last"`
+	Path string    `json:"path"`
+	Size int64     `json:"size"`
+	Tier string    `json:"tier"`
+	Last time.Time `json:"last"`
 }
 
-// Warm pulls a file into the page cache, evicting LRU entries first if needed
-// to stay within budget. Re-warming an already-warm file just refreshes its LRU
-// timestamp.
-func (p *Pool) Warm(path string) error {
+// Status reports per-tier usage and the warmed files, newest first.
+type Status struct {
+	CacheUsed   int64  `json:"cache_used"`
+	CacheBudget int64  `json:"cache_budget"`
+	LockUsed    int64  `json:"locked_used"`
+	LockBudget  int64  `json:"locked_budget"`
+	Files       []Info `json:"files"`
+}
+
+// Warm pulls a file into RAM at the given tier, evicting LRU entries of that
+// same tier first if needed. Re-warming at the same tier refreshes LRU; warming
+// at a different tier promotes/demotes the file.
+func (p *Pool) Warm(path string, tier Tier) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if e, ok := p.entries[path]; ok {
-		e.last = p.now()
-		return nil
+		if e.tier == tier {
+			e.last = p.now()
+			return nil
+		}
+		if err := p.releaseLocked(e); err != nil { // tier change: re-map
+			return err
+		}
 	}
 
 	fi, err := os.Stat(path)
@@ -74,23 +122,27 @@ func (p *Pool) Warm(path string) error {
 	if size <= 0 {
 		return fmt.Errorf("empty file %s", path)
 	}
-	if p.budget > 0 && size > p.budget {
-		return fmt.Errorf("file %s (%d bytes) exceeds RAM budget (%d)", path, size, p.budget)
+	if b := p.budget[tier]; b > 0 && size > b {
+		return fmt.Errorf("file %s (%d bytes) exceeds %s budget (%d)", path, size, tier, b)
 	}
-	if err := p.evictToFitLocked(size); err != nil {
+	if err := p.evictToFitLocked(tier, size); err != nil {
 		return err
 	}
 
-	data, locked, err := mapAndFault(path, size, p.lock)
+	data, locked, err := mapAndFault(path, size, tier == TierLocked)
 	if err != nil {
 		return err
 	}
-	p.entries[path] = &entry{path: path, data: data, size: size, last: p.now(), locked: locked}
-	p.used += size
+	if tier == TierLocked && !locked {
+		_ = syscall.Munmap(data)
+		return fmt.Errorf("mlock %s failed (raise RLIMIT_MEMLOCK or lower locked budget)", path)
+	}
+	p.entries[path] = &entry{path: path, data: data, size: size, tier: tier, last: p.now()}
+	p.used[tier] += size
 	return nil
 }
 
-// Evict releases a warmed file. It is a no-op if the file is not warm.
+// Evict releases a warmed file regardless of tier. No-op if not warm.
 func (p *Pool) Evict(path string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -101,28 +153,34 @@ func (p *Pool) Evict(path string) error {
 	return p.releaseLocked(e)
 }
 
-// Status returns a snapshot of the warm-pool and its byte usage.
-func (p *Pool) Status() (used, budget int64, files []Info) {
+// Snapshot returns the current pool status.
+func (p *Pool) Snapshot() Status {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	files = make([]Info, 0, len(p.entries))
+	files := make([]Info, 0, len(p.entries))
 	for _, e := range p.entries {
-		files = append(files, Info{Path: e.path, Size: e.size, Locked: e.locked, Last: e.last})
+		files = append(files, Info{Path: e.path, Size: e.size, Tier: e.tier.String(), Last: e.last})
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Last.After(files[j].Last) })
-	return p.used, p.budget, files
+	return Status{
+		CacheUsed:   p.used[TierCache],
+		CacheBudget: p.budget[TierCache],
+		LockUsed:    p.used[TierLocked],
+		LockBudget:  p.budget[TierLocked],
+		Files:       files,
+	}
 }
 
-// evictToFitLocked frees LRU entries until need bytes fit under budget. Caller
-// holds p.mu.
-func (p *Pool) evictToFitLocked(need int64) error {
-	if p.budget <= 0 {
+// evictToFitLocked frees LRU entries of the given tier until need bytes fit.
+func (p *Pool) evictToFitLocked(tier Tier, need int64) error {
+	budget := p.budget[tier]
+	if budget <= 0 {
 		return nil
 	}
-	for p.used+need > p.budget {
-		victim := p.lruLocked()
+	for p.used[tier]+need > budget {
+		victim := p.lruLocked(tier)
 		if victim == nil {
-			return fmt.Errorf("cannot free %d bytes under budget %d", need, p.budget)
+			return fmt.Errorf("cannot free %d bytes under %s budget %d", need, tier, budget)
 		}
 		if err := p.releaseLocked(victim); err != nil {
 			return err
@@ -131,9 +189,12 @@ func (p *Pool) evictToFitLocked(need int64) error {
 	return nil
 }
 
-func (p *Pool) lruLocked() *entry {
+func (p *Pool) lruLocked(tier Tier) *entry {
 	var oldest *entry
 	for _, e := range p.entries {
+		if e.tier != tier {
+			continue
+		}
 		if oldest == nil || e.last.Before(oldest.last) {
 			oldest = e
 		}
@@ -141,14 +202,13 @@ func (p *Pool) lruLocked() *entry {
 	return oldest
 }
 
-// releaseLocked unmaps (and unlocks) a warmed file. Caller holds p.mu.
 func (p *Pool) releaseLocked(e *entry) error {
-	if e.locked {
+	if e.tier == TierLocked {
 		_ = syscall.Munlock(e.data)
 	}
 	err := syscall.Munmap(e.data)
 	delete(p.entries, e.path)
-	p.used -= e.size
+	p.used[e.tier] -= e.size
 	if err != nil {
 		return fmt.Errorf("munmap %s: %w", e.path, err)
 	}
@@ -157,41 +217,33 @@ func (p *Pool) releaseLocked(e *entry) error {
 
 // mapAndFault mmaps the file read-only, advises WILLNEED, touches every page to
 // fault it into the page cache, and optionally mlocks it.
-func mapAndFault(path string, size int64, lock bool) ([]byte, bool, error) {
+func mapAndFault(path string, size int64, lock bool) (data []byte, locked bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, false, fmt.Errorf("open %s: %w", path, err)
 	}
-	defer f.Close() // fd may be closed once mapped
+	defer f.Close() // fd may close once mapped
 
-	data, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	data, err = syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
 	if err != nil {
 		return nil, false, fmt.Errorf("mmap %s: %w", path, err)
 	}
 	_ = syscall.Madvise(data, syscall.MADV_WILLNEED)
 
 	// Touch one byte per page to force the pages resident.
-	var sink byte
+	var s byte
 	for i := 0; i < len(data); i += pageSize {
-		sink ^= data[i]
+		s ^= data[i]
 	}
-	runtimeKeepByte(sink)
+	sink = s
 
-	locked := false
 	if lock {
-		if err := syscall.Mlock(data); err != nil {
-			// Non-fatal: pages are still warm, just not pinned.
-			locked = false
-		} else {
+		if err := syscall.Mlock(data); err == nil {
 			locked = true
 		}
 	}
 	return data, locked, nil
 }
 
-// runtimeKeepByte prevents the page-faulting loop from being optimized away.
-//
-//go:noinline
-func runtimeKeepByte(b byte) { sink = b }
-
+// sink defeats dead-code elimination of the page-faulting loop.
 var sink byte

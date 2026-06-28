@@ -7,8 +7,9 @@ package models
 type Model struct {
 	ID   string `json:"id"`
 	Path string `json:"path"`
-	NGL  int    `json:"ngl"` // GPU layers to offload (99 = all)
-	Ctx  int    `json:"ctx"` // context window
+	NGL  int    `json:"ngl"`  // GPU layers to offload (99 = all)
+	Ctx  int    `json:"ctx"`  // context window
+	Tier string `json:"tier"` // default warm tier: "cache" (default) | "locked"
 }
 
 // Registry is an immutable, concurrency-safe lookup of models by ID.

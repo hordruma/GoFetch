@@ -21,15 +21,15 @@ type Config struct {
 
 // EngineConfig selects and configures the inference engine.
 type EngineConfig struct {
-	Type           string `json:"type"`             // "llama-swap" | "direct"
+	Type           string `json:"type"`             // "llama-swap" | "direct" | "embedded"
 	Upstream       string `json:"upstream"`         // llama-swap base URL
 	LlamaServerBin string `json:"llama_server_bin"` // direct: llama-server binary
 }
 
-// RAMConfig bounds the warm-pool.
+// RAMConfig bounds the two-tier warm-pool.
 type RAMConfig struct {
-	BudgetBytes int64 `json:"budget_bytes"` // max bytes held in the page cache
-	Lock        bool  `json:"lock"`         // mlock warmed files into RAM
+	BudgetBytes       int64 `json:"budget_bytes"`        // TierCache budget (page-cache warm)
+	LockedBudgetBytes int64 `json:"locked_budget_bytes"` // TierLocked budget (mlock-pinned)
 }
 
 // KVConfig bounds the KV snapshot store.
@@ -70,6 +70,8 @@ func (c *Config) validate() error {
 		if c.Engine.LlamaServerBin == "" {
 			return fmt.Errorf("engine.llama_server_bin required for direct engine")
 		}
+	case "embedded":
+		// In-process CUDA engine; requires a -tags cuda build (validated at init).
 	default:
 		return fmt.Errorf("unknown engine.type %q", c.Engine.Type)
 	}

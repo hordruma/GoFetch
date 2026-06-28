@@ -27,6 +27,7 @@ func main() {
 	}
 
 	reg := models.NewRegistry(cfg.Models)
+	pool := warm.New(cfg.RAM.BudgetBytes, cfg.RAM.LockedBudgetBytes)
 
 	var eng engine.Engine
 	switch cfg.Engine.Type {
@@ -34,6 +35,8 @@ func main() {
 		eng, err = engine.NewLlamaSwap(cfg.Engine.Upstream)
 	case "direct":
 		eng, err = engine.NewDirect(cfg.Engine.LlamaServerBin, reg)
+	case "embedded":
+		eng, err = engine.NewEmbedded(reg, pool)
 	default:
 		slog.Error("unknown engine type", "type", cfg.Engine.Type)
 		os.Exit(1)
@@ -43,7 +46,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	pool := warm.New(cfg.RAM.BudgetBytes, cfg.RAM.Lock)
 	kv, err := kvcache.New(cfg.KV.Dir, cfg.KV.BudgetBytes)
 	if err != nil {
 		slog.Error("init kv store", "err", err)

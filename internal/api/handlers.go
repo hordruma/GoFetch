@@ -3,11 +3,15 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+
+	"github.com/hordruma/gofetch/internal/warm"
 )
 
-// modelReq is the body for endpoints addressing a single model.
+// modelReq is the body for endpoints addressing a single model. Tier is only
+// honored by /v1/ram/warm; empty falls back to the model's configured tier.
 type modelReq struct {
 	Model string `json:"model"`
+	Tier  string `json:"tier,omitempty"`
 }
 
 // kvReq is the body for KV snapshot endpoints.
@@ -45,11 +49,10 @@ func (s *Server) resolvePath(w http.ResponseWriter, id string) (string, bool) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	ramUsed, ramBudget, files := s.warm.Status()
 	kvUsed, kvBudget, kvItems := s.kv.Status()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"vram": map[string]any{"active": s.eng.Active()},
-		"ram":  map[string]any{"used": ramUsed, "budget": ramBudget, "files": files},
+		"ram":  s.warm.Snapshot(),
 		"kv":   map[string]any{"used": kvUsed, "budget": kvBudget, "items": kvItems},
 	})
 }
@@ -87,15 +90,25 @@ func (s *Server) handleRAMWarm(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	path, ok := s.resolvePath(w, req.Model)
+	m, ok := s.reg.Get(req.Model)
 	if !ok {
+		writeErr(w, http.StatusNotFound, "unknown model "+req.Model)
 		return
 	}
-	if err := s.warm.Warm(path); err != nil {
+	tierStr := req.Tier
+	if tierStr == "" {
+		tierStr = m.Tier // fall back to the model's configured default tier
+	}
+	tier, err := warm.ParseTier(tierStr)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.warm.Warm(m.Path, tier); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"warmed": req.Model})
+	writeJSON(w, http.StatusOK, map[string]any{"warmed": req.Model, "tier": tier.String()})
 }
 
 func (s *Server) handleRAMEvict(w http.ResponseWriter, r *http.Request) {

@@ -23,10 +23,12 @@ go build ./...
 ```
 GET  /v1/status
 POST /v1/vram/load  {model}      POST /v1/vram/drop  {model}
-POST /v1/ram/warm   {model}      POST /v1/ram/evict  {model}
+POST /v1/ram/warm   {model,tier} POST /v1/ram/evict  {model}   # tier: cache|locked
 POST /v1/kv/save    {model,key}  POST /v1/kv/load    {model,key}  POST /v1/kv/evict {model,key}
 POST /v1/chat/completions ...    # OpenAI-compatible passthrough
 ```
 
-Status: **M0 skeleton** — compiles, API surface and warm-pool in place; engine
-swap and KV wiring are the next milestones (see DESIGN.md).
+Status: **M0 skeleton** — compiles, unit-tested. Two-tier warm-pool
+(`cache`/`locked`) in place; the in-process CUDA engine for the fast-swap path is
+a build-tagged seam (`-tags cuda`, see DESIGN.md "M-deep"). Engine swap and KV
+wiring are the next milestones.
