@@ -1,3 +1,5 @@
+THIS IS AN UNTESTED SCAFFOLD. MADE PUBLIC FOR SHARING, BUT NOT READY FOR USE --- UNTESTED!
+
 # GoFetch
 
 Mechanical memory plane for a local LLM stack: load, warm, drop, and swap models
