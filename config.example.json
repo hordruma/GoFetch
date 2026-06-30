@@ -1,0 +1,32 @@
+{
+  "listen": ":8080",
+  "engine": {
+    "type": "llama-swap",
+    "upstream": "http://127.0.0.1:8081",
+    "llama_server_bin": "llama-server"
+  },
+  "ram": {
+    "budget_bytes": 42949672960,
+    "locked_budget_bytes": 10737418240
+  },
+  "kv": {
+    "dir": "/dev/shm/gofetch-kv",
+    "budget_bytes": 8589934592
+  },
+  "models": [
+    {
+      "id": "qwen2.5-7b-instruct-q4",
+      "path": "/models/qwen2.5-7b-instruct-q4_k_m.gguf",
+      "ngl": 99,
+      "ctx": 8192,
+      "tier": "locked"
+    },
+    {
+      "id": "bge-reranker-v2-m3-q8",
+      "path": "/models/bge-reranker-v2-m3-q8_0.gguf",
+      "ngl": 99,
+      "ctx": 512,
+      "tier": "cache"
+    }
+  ]
+}
