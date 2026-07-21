@@ -164,14 +164,22 @@ internal/api/        HTTP control API + OpenAI proxy
 
 ## Milestones
 
-1. **M0 — skeleton:** packages, API surface, two-tier warm-pool, KV store
+Measured results for everything marked ✅ are in [docs/verification.md](./docs/verification.md).
+
+1. ✅ **M0 — skeleton:** packages, API surface, two-tier warm-pool, KV store
    accounting, llama-swap + direct engine stubs. Compiles, unit-tested.
-2. **M1 — real swap:** `direct` engine starts/stops `llama-server`, proxies
-   OpenAI traffic, enforces the single-VRAM-slot invariant.
-3. **M3 — doc-KV:** wire llama.cpp `--slot-save-path`; save/restore snapshots on
-   tmpfs keyed by `(model, key)`; LRU evict by KV budget.
-4. **M4 — llama-swap engine:** force-load / unload via llama-swap management API;
-   reconcile its lifecycle with the warm-pool.
+2. ✅ **M1 — real swap:** `direct` engine starts/stops `llama-server`, proxies
+   OpenAI traffic, enforces the single-VRAM-slot invariant. Bounded startup
+   (the engine mutex is held across a load, so the wait must be finite), backend
+   output surfaced to the log, SIGTERM before SIGKILL so VRAM is freed cleanly.
+   The OpenAI passthrough auto-loads the model named in the request.
+3. ✅ **M3 — doc-KV:** llama.cpp is started with `--slot-save-path` and `-np 1`
+   (one slot, so "the prompt cache" is unambiguous); `/v1/kv/save` and
+   `/v1/kv/load` drive its slot save/restore, keyed by `(model, key)`, with LRU
+   eviction by KV budget. Snapshots are refused unless their model is resident.
+4. ✅ **M4 — llama-swap engine:** force-load through llama-swap's direct-access
+   route, unload through `POST /api/models/unload/:model`, and `Active()` reads
+   back `GET /running` rather than reporting GoFetch's own intent.
 5. **M-deep — in-process engine:** cgo + vendored llama.cpp; `cudaHostRegister`
    on the `locked` tier, persistent context, in-place model free/load,
    multi-stream upload. Built and benchmarked on the 5060 (not in CI).
