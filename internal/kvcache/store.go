@@ -47,6 +47,13 @@ func New(dir string, budget int64) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir kv dir: %w", err)
 	}
+	// Snapshots left by a previous process are unrecoverable: the filename is a
+	// hash of (model, key) and cannot be reversed, so they could never be looked
+	// up again — but they would still consume the tmpfs the budget is meant to
+	// bound. Start from a clean directory.
+	if err := purge(dir); err != nil {
+		return nil, err
+	}
 	return &Store{
 		dir:     dir,
 		budget:  budget,
@@ -55,16 +62,42 @@ func New(dir string, budget int64) (*Store, error) {
 	}, nil
 }
 
+// purge removes every snapshot file in dir. Only *.kv files are touched, so
+// pointing the store at a shared tmpfs does not clobber unrelated data.
+func purge(dir string) error {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.kv"))
+	if err != nil {
+		return fmt.Errorf("scan kv dir: %w", err)
+	}
+	for _, f := range matches {
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("purge stale snapshot: %w", err)
+		}
+	}
+	return nil
+}
+
 // id is a stable, collision-resistant identifier for a (model, key) pair.
 func id(model, key string) string {
 	sum := sha256.Sum256([]byte(model + "\x00" + key))
 	return hex.EncodeToString(sum[:16])
 }
 
-// FileFor returns the absolute snapshot path for (model, key). This is the path
-// GoFetch passes to llama.cpp as the slot save/restore filename.
+// Dir returns the snapshot directory, which is what llama.cpp is given as
+// --slot-save-path.
+func (s *Store) Dir() string { return s.dir }
+
+// NameFor returns the bare snapshot filename for (model, key). llama.cpp
+// resolves slot filenames beneath its own --slot-save-path and rejects anything
+// containing a path separator, so this — not FileFor — is what it is given.
+func (s *Store) NameFor(model, key string) string {
+	return id(model, key) + ".kv"
+}
+
+// FileFor returns the absolute snapshot path for (model, key), which is where
+// the engine's write lands and what the store accounts.
 func (s *Store) FileFor(model, key string) string {
-	return filepath.Join(s.dir, id(model, key)+".kv")
+	return filepath.Join(s.dir, s.NameFor(model, key))
 }
 
 // Register records a snapshot that has just been written to FileFor(model, key),
@@ -83,10 +116,15 @@ func (s *Store) Register(model, key string) error {
 		s.used -= old.size
 		delete(s.entries, sid)
 	}
+	// A snapshot the store refuses to account for must not be left behind: it is
+	// unreachable (never registered) yet still occupies the tmpfs the budget
+	// bounds, so the accounting would silently drift from what is on disk.
 	if s.budget > 0 && fi.Size() > s.budget {
+		_ = os.Remove(file)
 		return fmt.Errorf("snapshot %d bytes exceeds KV budget %d", fi.Size(), s.budget)
 	}
 	if err := s.evictToFitLocked(sid, fi.Size()); err != nil {
+		_ = os.Remove(file)
 		return err
 	}
 	s.entries[sid] = &meta{model: model, key: key, file: file, size: fi.Size(), last: s.now()}

@@ -104,14 +104,13 @@ func (p *Pool) Warm(path string, tier Tier) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if e, ok := p.entries[path]; ok {
-		if e.tier == tier {
-			e.last = p.now()
-			return nil
-		}
-		if err := p.releaseLocked(e); err != nil { // tier change: re-map
-			return err
-		}
+	// A tier change re-maps the file. The old mapping is held until the new one
+	// is fully established so that a rejected promotion (over budget, mlock
+	// refused) leaves the file warm at its original tier rather than dropping it.
+	old, promoting := p.entries[path]
+	if promoting && old.tier == tier {
+		old.last = p.now()
+		return nil
 	}
 
 	fi, err := os.Stat(path)
@@ -136,6 +135,12 @@ func (p *Pool) Warm(path string, tier Tier) error {
 	if tier == TierLocked && !locked {
 		_ = syscall.Munmap(data)
 		return fmt.Errorf("mlock %s failed (raise RLIMIT_MEMLOCK or lower locked budget)", path)
+	}
+	if promoting { // new mapping is live; the old tier's copy can go
+		if err := p.releaseLocked(old); err != nil {
+			_ = syscall.Munmap(data)
+			return err
+		}
 	}
 	p.entries[path] = &entry{path: path, data: data, size: size, tier: tier, last: p.now()}
 	p.used[tier] += size
