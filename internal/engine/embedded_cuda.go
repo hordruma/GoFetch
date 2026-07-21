@@ -97,6 +97,20 @@ func (e *Embedded) Active() string {
 	return e.active
 }
 
+// SaveKV is not available in-process yet: the embedded engine owns the KV cache
+// directly, so snapshots will go through llama_state_seq_save_file rather than
+// the server's slot endpoint.
+func (e *Embedded) SaveKV(context.Context, string) (KVStats, error) {
+	// TODO(M-deep): llama_state_seq_save_file(e.ctx, path, seq_id, ...).
+	return KVStats{}, fmt.Errorf("embedded engine KV snapshots not yet implemented")
+}
+
+// LoadKV is the restore counterpart to SaveKV.
+func (e *Embedded) LoadKV(context.Context, string) (KVStats, error) {
+	// TODO(M-deep): llama_state_seq_load_file(e.ctx, path, seq_id, ...).
+	return KVStats{}, fmt.Errorf("embedded engine KV snapshots not yet implemented")
+}
+
 // ServeHTTP runs an OpenAI-compatible request against the resident model.
 func (e *Embedded) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// TODO(M-deep): translate the OpenAI request, run llama_decode in-process,
