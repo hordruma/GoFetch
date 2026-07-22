@@ -63,9 +63,9 @@ document whose prefill drops from 490 ms to 24 ms when its KV snapshot is
 restored.
 
 The in-process `embedded` engine is implemented and measured up to a 14B that
-fills 91% of the 8 GB VRAM: real in-process inference, SSE streaming, no-restart
-swap (~0.6 s/swap faster than `direct`), prompt-prefix reuse, and 31 ms KV
-restore.
+fills 91% of the 8 GB VRAM: real in-process inference, SSE streaming,
+`/v1/embeddings` (pooled, L2-normalized), no-restart swap (~0.6 s/swap faster
+than `direct`), prompt-prefix reuse, and 31 ms KV restore.
 
 **Not verified:** the CUDA-specific weight-upload path — registering the warm
 tier and DMA'ing into llama.cpp's own loader — which needs a from-source CUDA

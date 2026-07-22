@@ -83,8 +83,18 @@ wavelengths more effectively...") and streams. No-restart swaps between the 14B
 (7.4 GB) and 7B (6.3 GB) run 1.9–2.2 s each in one process, VRAM cycled
 correctly — a single 8 GB slot holding one large model at a time.
 
-Not yet in the embedded engine: `/v1/embeddings`. The `direct` / `llama-swap`
-engines serve it by reverse-proxying llama.cpp.
+**Embeddings** (`/v1/embeddings`) work in-process too. The context is rebuilt in
+pooled-embedding mode (`embeddings=true`, MEAN pooling) — switching a resident
+model between generation and embedding rebuilds only the context, not the model.
+Verified with bge-small-en-v1.5 (384-dim, L2-normalized): a cat sentence scores
+0.785 against a kitten sentence and 0.730 against a feline one, but only 0.307
+against "the stock market crashed" — correct semantic ordering. Mode-switching
+holds on one daemon: qwen-1.5B generated "Rome", embedded the same model (1536-d,
+mean-pooled), generated "Madrid" (context correctly back in generation mode),
+then bge embedded (384-d). String and array `input` both accepted; batched.
+
+The embedded engine now covers the full inference surface it needs:
+chat/completions (streaming + non), and embeddings.
 
 **Build.** The engine needs llama.cpp headers + a libllama; no toolkit build
 required if you use a prebuilt release:

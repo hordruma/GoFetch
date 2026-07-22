@@ -55,6 +55,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -80,6 +81,9 @@ type Embedded struct {
 	ctx    *C.struct_llama_context
 	vocab  *C.struct_llama_vocab
 	nCtx   int
+	// embedMode is whether the current context was built for pooled embeddings
+	// (vs generation). Switching modes on a resident model rebuilds the context.
+	embedMode bool
 	// tokens currently committed to KV sequence 0, positions 0..len-1. Tracked
 	// so a follow-up request can reuse the matching prefix instead of
 	// re-prefilling, and so KV snapshots record their token stream.
@@ -103,54 +107,69 @@ func NewEmbedded(reg *models.Registry, pool *warm.Pool, libDir, kvDir string) (E
 	return &Embedded{reg: reg, pool: pool, kvDir: kvDir}, nil
 }
 
-// EnsureResident makes modelID the resident model, swapping in place without
-// tearing down the backend or GPU context.
+// EnsureResident makes modelID the resident model (in generation mode),
+// swapping in place without tearing down the backend or GPU context.
 func (e *Embedded) EnsureResident(_ context.Context, modelID string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.ensureLocked(modelID)
+	return e.ensureLocked(modelID, false)
 }
 
-func (e *Embedded) ensureLocked(modelID string) error {
-	if e.active == modelID && e.model != nil {
-		return nil
-	}
+// ensureLocked makes modelID resident and its context configured for the
+// requested mode (embed=false: generation/logits; embed=true: pooled
+// embeddings). Switching a resident model between modes rebuilds only the
+// context — the model stays loaded, so it is cheap. Caller holds e.mu.
+func (e *Embedded) ensureLocked(modelID string, embed bool) error {
 	m, ok := e.reg.Get(modelID)
 	if !ok {
 		return fmt.Errorf("unknown model %q", modelID)
 	}
-	e.freeLocked() // free the outgoing model; backend + context lib stay alive
 
-	// NB: do not pool.Warm here. llama.cpp mmaps and faults the GGUF itself
-	// during load; pre-faulting it synchronously on the load path just reads the
-	// whole file twice. Warming is a proactive operation (POST /v1/ram/warm)
-	// meant to run *before* a load is requested, not inside it.
+	// (Re)load the model only when it actually changes.
+	if e.active != modelID || e.model == nil {
+		e.freeLocked() // free the outgoing model; backend stays inited
 
-	cpath := C.CString(m.Path)
-	defer C.free(unsafe.Pointer(cpath))
-	mp := C.llama_model_default_params()
-	mp.n_gpu_layers = C.int32_t(m.NGL)
-	t0 := time.Now()
-	model := C.llama_model_load_from_file(cpath, mp)
-	if model == nil {
-		return fmt.Errorf("load model %q: llama_model_load_from_file failed", modelID)
+		// NB: no pool.Warm here — llama.cpp mmaps and faults the GGUF itself
+		// during load, so pre-faulting on the load path just reads it twice.
+		cpath := C.CString(m.Path)
+		mp := C.llama_model_default_params()
+		mp.n_gpu_layers = C.int32_t(m.NGL)
+		t0 := time.Now()
+		model := C.llama_model_load_from_file(cpath, mp)
+		C.free(unsafe.Pointer(cpath))
+		if model == nil {
+			return fmt.Errorf("load model %q: llama_model_load_from_file failed", modelID)
+		}
+		nctx := m.Ctx
+		if nctx <= 0 {
+			nctx = 4096
+		}
+		e.model, e.vocab, e.active, e.nCtx = model, C.llama_model_get_vocab(model), modelID, nctx
+		e.ctx = nil // force a fresh context below
+		slog.Info("embedded: model loaded", "model", modelID, "ms", time.Since(t0).Milliseconds())
 	}
 
-	cp := C.llama_context_default_params()
-	nctx := m.Ctx
-	if nctx <= 0 {
-		nctx = 4096
+	// (Re)build the context when missing or when the mode changes.
+	if e.ctx == nil || e.embedMode != embed {
+		if e.ctx != nil {
+			C.llama_free(e.ctx)
+			e.ctx = nil
+		}
+		cp := C.llama_context_default_params()
+		cp.n_ctx = C.uint32_t(e.nCtx)
+		if embed {
+			// Pooled sequence embeddings. MEAN is a sane default that also works
+			// on generative models; an embedding model with its own pooling still
+			// pools per sequence, which is what llama_get_embeddings_seq returns.
+			cp.embeddings = C.bool(true)
+			cp.pooling_type = C.LLAMA_POOLING_TYPE_MEAN
+		}
+		ctx := C.llama_init_from_model(e.model, cp)
+		if ctx == nil {
+			return fmt.Errorf("init context for %q (embed=%v) failed", modelID, embed)
+		}
+		e.ctx, e.embedMode, e.tokens = ctx, embed, e.tokens[:0]
 	}
-	cp.n_ctx = C.uint32_t(nctx)
-	ctx := C.llama_init_from_model(model, cp)
-	if ctx == nil {
-		C.llama_model_free(model)
-		return fmt.Errorf("init context for %q failed", modelID)
-	}
-
-	e.model, e.ctx, e.vocab = model, ctx, C.llama_model_get_vocab(model)
-	e.nCtx, e.active, e.tokens = nctx, modelID, e.tokens[:0]
-	slog.Info("embedded: model resident", "model", modelID, "ms", time.Since(t0).Milliseconds())
 	return nil
 }
 
@@ -378,13 +397,17 @@ type oaiRequest struct {
 	Stream      bool          `json:"stream"`
 }
 
-// ServeHTTP runs an OpenAI-compatible completion in-process. It supports
-// /v1/chat/completions and /v1/completions, streaming (SSE) when the request
-// sets "stream": true; other endpoints are not served by the embedded engine.
+// ServeHTTP runs an OpenAI-compatible request in-process. It supports
+// /v1/chat/completions and /v1/completions (streaming via "stream": true) and
+// /v1/embeddings.
 func (e *Embedded) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil {
 		httpErr(w, http.StatusBadRequest, "read body: "+err.Error())
+		return
+	}
+	if strings.Contains(r.URL.Path, "embeddings") {
+		e.serveEmbeddings(w, body)
 		return
 	}
 	var req oaiRequest
@@ -406,7 +429,7 @@ func (e *Embedded) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer e.mu.Unlock()
 
 	if req.Model != "" {
-		if err := e.ensureLocked(req.Model); err != nil {
+		if err := e.ensureLocked(req.Model, false); err != nil {
 			httpErr(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
@@ -414,6 +437,12 @@ func (e *Embedded) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if e.ctx == nil {
 		httpErr(w, http.StatusServiceUnavailable, "no model resident")
 		return
+	}
+	if e.embedMode { // resident context is in embed mode; rebuild for generation
+		if err := e.ensureLocked(e.active, false); err != nil {
+			httpErr(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 	}
 
 	// Build the prompt: chat template for chat requests, raw prompt otherwise.
@@ -548,6 +577,136 @@ func (e *Embedded) writeCompletion(w http.ResponseWriter, id, model string, chat
 		"id": id, "object": object, "model": model,
 		"choices": []any{choice}, "usage": usage,
 	})
+}
+
+// --- embeddings ---
+
+type embedRequest struct {
+	Model string          `json:"model"`
+	Input json.RawMessage `json:"input"` // string OR []string
+}
+
+// serveEmbeddings computes pooled embeddings for one or many inputs, OpenAI
+// /v1/embeddings shape. The resident context is put in embedding mode (rebuilt
+// if it was in generation mode).
+func (e *Embedded) serveEmbeddings(w http.ResponseWriter, body []byte) {
+	var req embedRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		httpErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	inputs, err := parseEmbedInput(req.Input)
+	if err != nil {
+		httpErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if req.Model != "" {
+		if err := e.ensureLocked(req.Model, true); err != nil {
+			httpErr(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+	}
+	if e.ctx == nil {
+		httpErr(w, http.StatusServiceUnavailable, "no model resident")
+		return
+	}
+	if !e.embedMode {
+		if err := e.ensureLocked(e.active, true); err != nil {
+			httpErr(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+	}
+
+	nEmbd := int(C.llama_model_n_embd(e.model))
+	data := make([]any, len(inputs))
+	totalToks := 0
+	for i, in := range inputs {
+		vec, nTok, err := e.embed(in, nEmbd)
+		if err != nil {
+			httpErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		totalToks += nTok
+		data[i] = map[string]any{"object": "embedding", "index": i, "embedding": vec}
+	}
+	writeJSONResp(w, map[string]any{
+		"object": "list", "model": req.Model, "data": data,
+		"usage": map[string]int{"prompt_tokens": totalToks, "total_tokens": totalToks},
+	})
+}
+
+// embed computes one L2-normalized pooled embedding. Caller holds e.mu and the
+// context is in embed mode.
+func (e *Embedded) embed(text string, nEmbd int) ([]float32, int, error) {
+	toks, err := e.tokenize(text, true, false)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(toks) == 0 {
+		return make([]float32, nEmbd), 0, nil
+	}
+	if len(toks) > e.nCtx {
+		return nil, 0, fmt.Errorf("input %d tokens exceeds context %d", len(toks), e.nCtx)
+	}
+
+	// Each input is independent: clear the KV so pooling covers only this text.
+	C.llama_memory_clear(C.llama_get_memory(e.ctx), C.bool(true))
+
+	batch := C.llama_batch_get_one(&toks[0], C.int32_t(len(toks)))
+	// Encoder models (BERT-style embedders) need llama_encode; decoder models
+	// use llama_decode. Pick by what the model advertises.
+	var rc C.int32_t
+	if bool(C.llama_model_has_encoder(e.model)) {
+		rc = C.llama_encode(e.ctx, batch)
+	} else {
+		rc = C.llama_decode(e.ctx, batch)
+	}
+	if rc != 0 {
+		return nil, 0, fmt.Errorf("embed decode failed")
+	}
+
+	ptr := C.llama_get_embeddings_seq(e.ctx, 0)
+	if ptr == nil {
+		return nil, 0, fmt.Errorf("no pooled embedding (model produced none)")
+	}
+	raw := unsafe.Slice((*C.float)(ptr), nEmbd)
+	vec := make([]float32, nEmbd)
+	var norm float64
+	for i := 0; i < nEmbd; i++ {
+		v := float32(raw[i])
+		vec[i] = v
+		norm += float64(v) * float64(v)
+	}
+	if norm > 0 { // L2-normalize so cosine similarity is a dot product
+		inv := float32(1 / math.Sqrt(norm))
+		for i := range vec {
+			vec[i] *= inv
+		}
+	}
+	return vec, len(toks), nil
+}
+
+// parseEmbedInput accepts OpenAI's string-or-array "input".
+func parseEmbedInput(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("input required")
+	}
+	var one string
+	if err := json.Unmarshal(raw, &one); err == nil {
+		return []string{one}, nil
+	}
+	var many []string
+	if err := json.Unmarshal(raw, &many); err == nil {
+		if len(many) == 0 {
+			return nil, fmt.Errorf("input array is empty")
+		}
+		return many, nil
+	}
+	return nil, fmt.Errorf("input must be a string or array of strings")
 }
 
 // --- in-process KV snapshots ---
