@@ -11,7 +11,7 @@ listed here is unverified.
 | RAM | 62 GB, `RLIMIT_MEMLOCK` 7.8 GB |
 | tmpfs | `/dev/shm`, 32 GB |
 | Backend | llama.cpp `b10075`, **Vulkan** build (inference); CUDA 12.9 runtime (probe) |
-| Models | Qwen2.5 0.5B Q4_K_M (491 MB), 1.5B Q4_K_M (1.12 GB), **7B Q6_K (6.25 GB)** |
+| Models | Qwen2.5 0.5B Q4_K_M (491 MB), 1.5B Q4_K_M (1.12 GB), 7B Q6_K (6.25 GB), **14B Q3_K_M (7.33 GB)** |
 | Go | 1.24.5 |
 
 PCIe link (measured under sustained transfer): trains to **Gen5 x8** — `width`
@@ -62,17 +62,29 @@ every time. The saving is fixed, so the relative win grows as models shrink.
 Raw weight transfer (~0.28 s of the 7B's load) is not where the time goes.
 
 It also serves real OpenAI-compatible inference in-process (chat + completions,
-via the model's own chat template) and does KV entirely in-process:
+via the model's own chat template), **streams** (SSE, `"stream": true` — verified
+delta-by-delta with the terminal `finish_reason` + `[DONE]` sentinel, and a
+disconnected client stops generation), and does KV entirely in-process:
 
 - **Prompt-prefix reuse** across requests: a repeat prompt over the same 7B
-  document went 0.52 s → 0.23 s (the shared prefix is not re-prefilled).
+  document went 0.52 s → 0.23 s (the shared prefix is not re-prefilled). At least
+  the final prompt token is always re-decoded so sampling reads fresh logits —
+  without that, a fully-cached prompt samples the *previous* request's trailing
+  logits and returns empty/garbage (a bug caught by the streaming tests).
 - **KV snapshot / restore** (`llama_state_save_file`): 1 077-token context →
   62 MB on tmpfs, saved in 28 ms; restored in **31 ms**, after which the same
   prompt skipped prefill (0.88 s fresh → 0.23 s), returning the correct answer.
 
-Not yet in the embedded engine: response **streaming** (SSE) — completions
-return whole — and `/v1/embeddings`. The `direct` / `llama-swap` engines stream
-(they reverse-proxy llama.cpp) and serve embeddings.
+**Filling the beam.** The 14B Q3_K_M loads to **7.39 GB — 91 % of the 8 GB** (at
+ctx 2048; ctx 4096 needs ~0.4 GB more for the compute buffer than fits, which
+the engine reports cleanly as a failed context init, freeing the model with no
+leak). It infers correctly ("...atmosphere scatters ... shorter blue
+wavelengths more effectively...") and streams. No-restart swaps between the 14B
+(7.4 GB) and 7B (6.3 GB) run 1.9–2.2 s each in one process, VRAM cycled
+correctly — a single 8 GB slot holding one large model at a time.
+
+Not yet in the embedded engine: `/v1/embeddings`. The `direct` / `llama-swap`
+engines serve it by reverse-proxying llama.cpp.
 
 **Build.** The engine needs llama.cpp headers + a libllama; no toolkit build
 required if you use a prebuilt release:

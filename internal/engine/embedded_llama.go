@@ -241,8 +241,10 @@ type genResult struct {
 }
 
 // generate decodes promptToks (reusing any KV prefix already resident) and
-// samples up to maxNew tokens. Caller holds e.mu.
-func (e *Embedded) generate(promptToks []C.llama_token, maxNew int, temp float64, seed uint32) (genResult, error) {
+// samples up to maxNew tokens. emit, if non-nil, is called with each token's
+// text as it is produced (the streaming path); returning an error from emit —
+// e.g. the client disconnected — stops generation cleanly. Caller holds e.mu.
+func (e *Embedded) generate(promptToks []C.llama_token, maxNew int, temp float64, seed uint32, emit func(string) error) (genResult, error) {
 	res := genResult{nPrompt: len(promptToks)}
 	if e.ctx == nil {
 		return res, fmt.Errorf("no model resident")
@@ -252,7 +254,16 @@ func (e *Embedded) generate(promptToks []C.llama_token, maxNew int, temp float64
 	}
 
 	// Reuse the matching prefix; drop KV cells past it and re-decode the rest.
+	// Cap the reuse at all-but-one prompt token: the last prompt token must be
+	// decoded this call so the logits sampling reads are fresh. Without this, a
+	// request whose prompt is entirely cached (e.g. an identical repeat, or a
+	// prompt fully covered by a restored KV snapshot) would sample from the
+	// logits left by the PREVIOUS request's final decode — producing wrong or
+	// empty output.
 	reuse := commonPrefix(promptToks, e.tokens)
+	if reuse >= len(promptToks) {
+		reuse = len(promptToks) - 1
+	}
 	res.nCached = reuse
 	mem := C.llama_get_memory(e.ctx)
 	if reuse < len(e.tokens) {
@@ -277,9 +288,16 @@ func (e *Embedded) generate(promptToks []C.llama_token, maxNew int, temp float64
 		if C.llama_vocab_is_eog(e.vocab, tok) {
 			break
 		}
-		b.WriteString(e.piece(tok))
+		piece := e.piece(tok)
+		b.WriteString(piece)
 		e.tokens = append(e.tokens, tok)
 		res.nGenerated++
+		if emit != nil {
+			if err := emit(piece); err != nil {
+				res.text = b.String()
+				return res, err
+			}
+		}
 		one := []C.llama_token{tok}
 		if C.llama_decode(e.ctx, C.llama_batch_get_one(&one[0], 1)) != 0 {
 			res.text = b.String()
@@ -361,8 +379,8 @@ type oaiRequest struct {
 }
 
 // ServeHTTP runs an OpenAI-compatible completion in-process. It supports
-// /v1/chat/completions and /v1/completions (non-streaming); other endpoints are
-// not served by the embedded engine.
+// /v1/chat/completions and /v1/completions, streaming (SSE) when the request
+// sets "stream": true; other endpoints are not served by the embedded engine.
 func (e *Embedded) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil {
@@ -435,18 +453,83 @@ func (e *Embedded) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		seed = *req.Seed
 	}
 
-	res, err := e.generate(promptToks, maxNew, temp, seed)
+	id := fmt.Sprintf("gofetch-%d", e.reqSeq.Add(1))
+
+	if req.Stream {
+		e.streamCompletion(w, id, req.Model, chat, promptToks, maxNew, temp, seed)
+		return
+	}
+
+	res, err := e.generate(promptToks, maxNew, temp, seed, nil)
 	if err != nil {
 		httpErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	slog.Info("embedded: completion", "model", req.Model, "prompt", res.nPrompt,
 		"cached", res.nCached, "generated", res.nGenerated)
-	e.writeCompletion(w, req.Model, chat, res.text, res.nPrompt, res.nGenerated)
+	e.writeCompletion(w, id, req.Model, chat, res.text, res.nPrompt, res.nGenerated)
 }
 
-func (e *Embedded) writeCompletion(w http.ResponseWriter, model string, chat bool, text string, nPrompt, nGen int) {
-	id := fmt.Sprintf("gofetch-%d", e.reqSeq.Add(1))
+// streamCompletion generates and streams tokens as OpenAI SSE chunks. The
+// caller holds e.mu (generation is serialized on the single context).
+func (e *Embedded) streamCompletion(w http.ResponseWriter, id, model string, chat bool, promptToks []C.llama_token, maxNew int, temp float64, seed uint32) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		httpErr(w, http.StatusInternalServerError, "streaming unsupported by the server")
+		return
+	}
+	object := "text_completion"
+	if chat {
+		object = "chat.completion.chunk"
+	}
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	send := func(choice map[string]any) error {
+		chunk := map[string]any{"id": id, "object": object, "model": model, "choices": []any{choice}}
+		b, _ := json.Marshal(chunk)
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	// Chat streams open with a role delta, then content deltas.
+	if chat {
+		_ = send(map[string]any{"index": 0, "delta": map[string]string{"role": "assistant"}})
+	}
+	emit := func(piece string) error {
+		if chat {
+			return send(map[string]any{"index": 0, "delta": map[string]string{"content": piece}})
+		}
+		return send(map[string]any{"index": 0, "text": piece})
+	}
+
+	res, err := e.generate(promptToks, maxNew, temp, seed, emit)
+	if err != nil {
+		// Mid-stream failures (including client disconnect) can only be signaled
+		// in-band; the status line is already sent. Log and stop.
+		slog.Warn("embedded: stream ended early", "model", model, "err", err,
+			"generated", res.nGenerated)
+		return
+	}
+	// Terminal chunk (finish_reason) then the OpenAI end-of-stream sentinel.
+	if chat {
+		_ = send(map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"})
+	} else {
+		_ = send(map[string]any{"index": 0, "text": "", "finish_reason": "stop"})
+	}
+	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
+	slog.Info("embedded: stream complete", "model", model, "prompt", res.nPrompt,
+		"cached", res.nCached, "generated", res.nGenerated)
+}
+
+func (e *Embedded) writeCompletion(w http.ResponseWriter, id, model string, chat bool, text string, nPrompt, nGen int) {
 	usage := map[string]int{
 		"prompt_tokens":     nPrompt,
 		"completion_tokens": nGen,
