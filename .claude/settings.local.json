@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go version *)",
+      "Bash(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv)",
+      "Read(//home/hor/**)",
+      "Read(//home/hor/Documents/**)",
+      "Read(//usr/local/go/**)",
+      "Bash(apt-cache policy *)",
+      "Bash(systemctl is-active *)",
+      "Read(//media/**)",
+      "Read(//usr/local/**)",
+      "Bash(nvcc --version)",
+      "Bash(grep -nA6 \"MODEL_STACK\" .env.example)",
+      "Bash(curl -sL https://go.dev/VERSION?m=text)",
+      "Bash(mkdir -p ~/.local)",
+      "Bash(curl -sLO https://go.dev/dl/go1.26.5.linux-amd64.tar.gz)",
+      "Bash(tar -C ~/.local -xzf go1.26.5.linux-amd64.tar.gz)",
+      "Bash(~/.local/go/bin/go version *)",
+      "Bash(curl -sSLO https://go.dev/dl/go1.24.5.linux-amd64.tar.gz)",
+      "Bash(rm -rf ~/.local/go)",
+      "Bash(tar -C ~/.local -xzf go1.24.5.linux-amd64.tar.gz)",
+      "Bash(mkdir -p /tmp/claude-1000/-home-hor-Documents-GitHub-GoFetch/56a3cc82-d6b5-484d-8304-e9129b24372e/scratchpad)",
+      "Bash(ulimit -l)",
+      "Bash(mkdir -p /tmp/claude-1000/-home-hor-Documents-GitHub-GoFetch/56a3cc82-d6b5-484d-8304-e9129b24372e/scratchpad/smoke/models)",
+      "Bash(find /home/hor/Documents/GitHub/llama-bin -maxdepth 3 -name llama-server -o -maxdepth 3 -name *.so)",
+      "Bash(export LD_LIBRARY_PATH=$R)",
+      "Bash(timeout 120 /home/hor/Documents/GitHub/llama-bin/llama-b10075/llama-cli -m /home/hor/models/qwen2.5-0.5b-instruct-q4_k_m.gguf -ngl 99 -no-cnv -p 'Reply with exactly: hello from the GPU' -n 12 --temp 0)"
+    ]
+  }
+}
