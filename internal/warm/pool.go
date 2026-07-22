@@ -220,8 +220,23 @@ func (p *Pool) releaseLocked(e *entry) error {
 	return nil
 }
 
-// mapAndFault mmaps the file read-only, advises WILLNEED, touches every page to
-// fault it into the page cache, and optionally mlocks it.
+// mapAndFault mmaps the file, advises WILLNEED, touches every page to fault it
+// into the page cache, and optionally mlocks it.
+//
+// The two tiers map with different flags, and the difference is load-bearing for
+// the fast DMA path — not an accident:
+//
+//   - cache tier: PROT_READ + MAP_SHARED. The lightest way to hold the GGUF hot
+//     in the shared page cache.
+//   - locked tier: PROT_READ|PROT_WRITE + MAP_PRIVATE (copy-on-write). Measured
+//     on an RTX 5060 (driver 580): cudaHostRegister REFUSES a read-only or
+//     MAP_SHARED file mapping with "invalid argument" — the driver requires a
+//     writable VMA it can page-lock for DMA. A COW mapping presents a writable
+//     VMA while its pages stay clean-shared with the page cache (weights are
+//     never written, so COW never actually breaks the sharing). This is the
+//     mapping the in-process engine (M-deep) can cudaHostRegister in place and
+//     DMA from at ~22 GB/s with no per-load copy. mlock does not affect
+//     registrability; it only guarantees residency. See docs/verification.md.
 func mapAndFault(path string, size int64, lock bool) (data []byte, locked bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -229,7 +244,11 @@ func mapAndFault(path string, size int64, lock bool) (data []byte, locked bool, 
 	}
 	defer f.Close() // fd may close once mapped
 
-	data, err = syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	prot, flags := syscall.PROT_READ, syscall.MAP_SHARED
+	if lock {
+		prot, flags = syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE
+	}
+	data, err = syscall.Mmap(int(f.Fd()), 0, int(size), prot, flags)
 	if err != nil {
 		return nil, false, fmt.Errorf("mmap %s: %w", path, err)
 	}

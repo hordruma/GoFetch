@@ -103,8 +103,14 @@ process. That ceilings what we can do, because three wins live *inside* the
 inference process and its CUDA context:
 
 1. **Fast DMA.** `cudaHostRegister()` the `locked`-tier region, then upload to
-   VRAM at the PCIe ceiling (~12–14 GB/s on x8 Gen4) instead of the pageable
-   path (~half that). Roughly halves the upload portion of a swap.
+   VRAM at the PCIe ceiling instead of the pageable path. **Measured on the 5060
+   (see docs/verification.md): 21.7 vs 15.4 GB/s (~1.4×), and register-in-place
+   is ~2× the copy-based pinned path per swap** because it skips a per-load
+   RAM→RAM copy. This only works because the `locked` tier maps the GGUF
+   copy-on-write (`PROT_READ|PROT_WRITE, MAP_PRIVATE`): the driver refuses to
+   register a read-only or `MAP_SHARED` file mapping. `mlock` is orthogonal — it
+   guarantees residency and removes page-fault stalls, but does not make a region
+   registrable.
 2. **No-restart swap.** Keep one process + one CUDA context alive across swaps;
    `llama_model_free()` the outgoing model and `llama_model_load_from_file()`
    the incoming one — skipping process spawn, context init, and GGUF re-parse.
