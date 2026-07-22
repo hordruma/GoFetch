@@ -111,16 +111,22 @@ inference process and its CUDA context:
    register a read-only or `MAP_SHARED` file mapping. `mlock` is orthogonal — it
    guarantees residency and removes page-fault stalls, but does not make a region
    registrable.
-2. **No-restart swap.** Keep one process + one CUDA context alive across swaps;
+2. **No-restart swap.** Keep one process + one GPU context alive across swaps;
    `llama_model_free()` the outgoing model and `llama_model_load_from_file()`
-   the incoming one — skipping process spawn, context init, and GGUF re-parse.
+   the incoming one — skipping process spawn, context init, and backend reload.
+   **Built and measured: ~0.6 s/swap faster than the `direct` engine** on the
+   5060 (docs/verification.md).
 3. **Overlapped upload.** Stage weights over multiple CUDA streams so transfer
-   overlaps buffer/graph setup.
+   overlaps buffer/graph setup. (Not built.)
 
-The `embedded` engine (`internal/engine/embedded_cuda.go`, build tag `cuda`)
-links llama.cpp via cgo to do this. It is a **development skeleton today** — the
-default build ships a stub that errors with a rebuild hint, and the CUDA file is
-pure-Go scaffolding with the integration points marked `TODO(M-deep)`.
+The `embedded` engine (`internal/engine/embedded_llama.go`, build tag
+`embedded`) links llama.cpp via cgo and delivers wins 1–2: a persistent context,
+in-place no-restart swap, real in-process OpenAI inference, and in-process KV
+(prompt-prefix reuse + `llama_state_save_file` snapshots). The default build
+ships a stub that errors with a rebuild hint. What remains is CUDA-specific:
+registering the warm tier and DMA'ing into llama.cpp's *own* weight loader (win
+#1 applied end-to-end), which needs a from-source CUDA build of llama.cpp; the
+transport itself is measured standalone by `gofetch-probe`.
 
 **What the floor is, and isn't.** Even fully built, a swap still costs the
 **PCIe upload of the weights** (~0.4–1 s for a 7B) plus buffer setup. The

@@ -51,7 +51,7 @@ one while a different model is resident is refused with `409`.
 |---|---|
 | `direct` | GoFetch spawns and supervises `llama-server` itself. One process at a time. |
 | `llama-swap` | GoFetch drives an external [llama-swap](https://github.com/mostlygeek/llama-swap): force-load, unload, and read back what is actually running. Its config must set `--slot-save-path` to GoFetch's `kv.dir` for KV snapshots. |
-| `embedded` | In-process llama.cpp + CUDA for the fast-swap path. Build-tagged (`-tags cuda`), **not implemented** — see DESIGN.md "M-deep". |
+| `embedded` | In-process llama.cpp (cgo): one persistent GPU context, no-restart in-place swap, and KV entirely in-process. Build-tagged (`-tags embedded`, needs libllama) — `make build-embedded`. Measured ~1.4–1.9× faster per swap than `direct`; see [docs/verification.md](./docs/verification.md). |
 
 ## Status
 
@@ -62,7 +62,12 @@ external engines. Measured numbers and the exact rig are in
 document whose prefill drops from 490 ms to 24 ms when its KV snapshot is
 restored.
 
-**Not verified:** the in-process CUDA engine (`-tags cuda`) and the H2D
-bandwidth probe. They need a CUDA toolkit, which llama.cpp does not ship
-prebuilt for Linux; every GPU number so far comes from a Vulkan build, which
-does not exercise the pinned-memory DMA path that engine is designed around.
+The in-process `embedded` engine is implemented and measured on a VRAM-filling
+7B (Q6_K, 6.3 GB): real in-process inference, no-restart swap (~0.6 s/swap
+faster than `direct`), prompt-prefix reuse, and 31 ms KV restore.
+
+**Not verified:** the CUDA-specific weight-upload path — registering the warm
+tier and DMA'ing into llama.cpp's own loader — which needs a from-source CUDA
+build of llama.cpp. The pinned-DMA transport is measured standalone (`-tags
+cuda` probe); wiring it into the loader is the remaining specialization. Current
+GPU inference runs on a Vulkan libllama.

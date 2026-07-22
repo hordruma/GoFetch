@@ -44,7 +44,7 @@ func main() {
 	case "direct":
 		eng, err = engine.NewDirect(cfg.Engine.LlamaServerBin, reg, kv.Dir())
 	case "embedded":
-		eng, err = engine.NewEmbedded(reg, pool)
+		eng, err = engine.NewEmbedded(reg, pool, cfg.Engine.LibDir, kv.Dir())
 	default:
 		slog.Error("unknown engine type", "type", cfg.Engine.Type)
 		os.Exit(1)
