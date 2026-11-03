@@ -24,6 +24,7 @@ type EngineConfig struct {
 	Type           string `json:"type"`             // "llama-swap" | "direct" | "embedded"
 	Upstream       string `json:"upstream"`         // llama-swap base URL
 	LlamaServerBin string `json:"llama_server_bin"` // direct: llama-server binary
+	LibDir         string `json:"lib_dir"`          // embedded: dir holding libggml-*.so backends
 }
 
 // RAMConfig bounds the two-tier warm-pool.
@@ -71,7 +72,9 @@ func (c *Config) validate() error {
 			return fmt.Errorf("engine.llama_server_bin required for direct engine")
 		}
 	case "embedded":
-		// In-process CUDA engine; requires a -tags cuda build (validated at init).
+		// In-process llama.cpp engine; requires a -tags embedded build linked
+		// against libllama (validated at NewEmbedded). lib_dir may be empty if the
+		// backend .so files are already on the loader path.
 	default:
 		return fmt.Errorf("unknown engine.type %q", c.Engine.Type)
 	}

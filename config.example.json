@@ -1,7 +1,7 @@
 {
   "listen": ":8080",
   "engine": {
-    "type": "llama-swap",
+    "type": "direct",
     "upstream": "http://127.0.0.1:8081",
     "llama_server_bin": "llama-server"
   },

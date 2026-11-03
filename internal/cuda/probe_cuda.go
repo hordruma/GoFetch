@@ -81,8 +81,12 @@ int gofetch_dma_probe(void* host, size_t n, int iters, size_t chunk, dma_result*
     // (1) pageable, monolithic
     bench_h2d(dev, host, n, iters, 0, &out->pageable_gbps, &out->pageable_peak_gbps);
 
-    // (2) register-in-place -> pinned, monolithic
-    t0 = now_s(); e = cudaHostRegister(host, n, cudaHostRegisterDefault); t1 = now_s();
+    // (2) register-in-place -> pinned, monolithic. cudaHostRegisterReadOnly
+    // suits read-only weights and is what the engine would use; the driver
+    // accepts it only on a writable VMA, which is why Probe maps the file
+    // copy-on-write (see the mmap in probe_cuda.go's Go side).
+    t0 = now_s(); e = cudaHostRegister(host, n, cudaHostRegisterReadOnly); t1 = now_s();
+    if (e != cudaSuccess) { cudaGetLastError(); t0 = now_s(); e = cudaHostRegister(host, n, cudaHostRegisterDefault); t1 = now_s(); }
     if (e == cudaSuccess) {
         out->reg_ok = 1;
         out->register_ms = (t1 - t0) * 1e3;
@@ -142,7 +146,12 @@ func Probe(path string, iters int, maxBytes, chunkBytes int64) (*Result, error) 
 		size = maxBytes
 	}
 
-	data, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+	// Map copy-on-write writable, mirroring warm.TierLocked: this is the mapping
+	// cudaHostRegister accepts (a read-only or MAP_SHARED file mapping is refused
+	// with "invalid argument"), so the register-in-place variant measures the
+	// real warm-tier path rather than always reporting "unavailable".
+	data, err := syscall.Mmap(int(f.Fd()), 0, int(size),
+		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_PRIVATE)
 	f.Close()
 	if err != nil {
 		return nil, fmt.Errorf("mmap: %w", err)

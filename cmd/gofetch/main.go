@@ -29,26 +29,28 @@ func main() {
 	reg := models.NewRegistry(cfg.Models)
 	pool := warm.New(cfg.RAM.BudgetBytes, cfg.RAM.LockedBudgetBytes)
 
+	// The KV store owns the snapshot directory, so it is created before the
+	// engine that must be told to write snapshots into it.
+	kv, err := kvcache.New(cfg.KV.Dir, cfg.KV.BudgetBytes)
+	if err != nil {
+		slog.Error("init kv store", "err", err)
+		os.Exit(1)
+	}
+
 	var eng engine.Engine
 	switch cfg.Engine.Type {
 	case "llama-swap":
 		eng, err = engine.NewLlamaSwap(cfg.Engine.Upstream)
 	case "direct":
-		eng, err = engine.NewDirect(cfg.Engine.LlamaServerBin, reg)
+		eng, err = engine.NewDirect(cfg.Engine.LlamaServerBin, reg, kv.Dir())
 	case "embedded":
-		eng, err = engine.NewEmbedded(reg, pool)
+		eng, err = engine.NewEmbedded(reg, pool, cfg.Engine.LibDir, kv.Dir())
 	default:
 		slog.Error("unknown engine type", "type", cfg.Engine.Type)
 		os.Exit(1)
 	}
 	if err != nil {
 		slog.Error("init engine", "err", err)
-		os.Exit(1)
-	}
-
-	kv, err := kvcache.New(cfg.KV.Dir, cfg.KV.BudgetBytes)
-	if err != nil {
-		slog.Error("init kv store", "err", err)
 		os.Exit(1)
 	}
 
